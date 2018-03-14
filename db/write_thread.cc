@@ -456,7 +456,8 @@ void WriteThread::EnterAsMemTableWriter(Writer* leader,
       last_writer->sequence + WriteBatchInternal::Count(last_writer->batch) - 1;
 }
 
-void WriteThread::ExitAsMemTableWriter(Writer* self, WriteGroup& write_group) {
+void WriteThread::ExitAsMemTableWriter(Writer* /*self*/,
+                                       WriteGroup& write_group) {
   Writer* leader = write_group.leader;
   Writer* last_writer = write_group.last_writer;
 
@@ -532,6 +533,11 @@ void WriteThread::ExitAsBatchGroupLeader(WriteGroup& write_group,
   Writer* leader = write_group.leader;
   Writer* last_writer = write_group.last_writer;
   assert(leader->link_older == nullptr);
+
+  // Propagate memtable write error to the whole group.
+  if (status.ok() && !write_group.status.ok()) {
+    status = write_group.status;
+  }
 
   if (enable_pipelined_write_) {
     // Notify writers don't write to memtable to exit.

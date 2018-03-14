@@ -121,13 +121,17 @@ class Slice {
 /**
  * A Slice that can be pinned with some cleanup tasks, which will be run upon
  * ::Reset() or object destruction, whichever is invoked first. This can be used
- * to avoid memcpy by having the PinnsableSlice object referring to the data
+ * to avoid memcpy by having the PinnableSlice object referring to the data
  * that is locked in the memory and release them after the data is consumed.
  */
 class PinnableSlice : public Slice, public Cleanable {
  public:
   PinnableSlice() { buf_ = &self_space_; }
   explicit PinnableSlice(std::string* buf) { buf_ = buf; }
+
+  // No copy constructor and copy assignment allowed.
+  PinnableSlice(PinnableSlice&) = delete;
+  PinnableSlice& operator=(PinnableSlice&) = delete;
 
   inline void PinSlice(const Slice& s, CleanupFunction f, void* arg1,
                        void* arg2) {
@@ -173,7 +177,7 @@ class PinnableSlice : public Slice, public Cleanable {
     }
   }
 
-  void remove_prefix(size_t n) {
+  void remove_prefix(size_t /*n*/) {
     assert(0);  // Not implemented
   }
 

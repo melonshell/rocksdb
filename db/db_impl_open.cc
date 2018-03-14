@@ -124,6 +124,17 @@ DBOptions SanitizeOptions(const std::string& dbname, const DBOptions& src) {
     result.avoid_flush_during_recovery = false;
   }
 
+#ifndef ROCKSDB_LITE
+  // When the DB is stopped, it's possible that there are some .trash files that
+  // were not deleted yet, when we open the DB we will find these .trash files
+  // and schedule them to be deleted (or delete immediately if SstFileManager
+  // was not used)
+  auto sfm = static_cast<SstFileManagerImpl*>(result.sst_file_manager.get());
+  for (size_t i = 0; i < result.db_paths.size(); i++) {
+    DeleteScheduler::CleanupDirectory(result.env, sfm, result.db_paths[i].path);
+  }
+#endif
+
   return result;
 }
 
@@ -345,6 +356,29 @@ Status DBImpl::Recover(
       assert(s.IsIOError());
       return s;
     }
+    // Verify compatibility of env_options_ and filesystem
+    {
+      unique_ptr<RandomAccessFile> idfile;
+      EnvOptions customized_env(env_options_);
+      customized_env.use_direct_reads |=
+          immutable_db_options_.use_direct_io_for_flush_and_compaction;
+      s = env_->NewRandomAccessFile(IdentityFileName(dbname_), &idfile,
+                                    customized_env);
+      if (!s.ok()) {
+        const char* error_msg = s.ToString().c_str();
+        // Check if unsupported Direct I/O is the root cause
+        customized_env.use_direct_reads = false;
+        s = env_->NewRandomAccessFile(IdentityFileName(dbname_), &idfile,
+                                      customized_env);
+        if (s.ok()) {
+          return Status::InvalidArgument(
+              "Direct I/O is not supported by the specified DB.");
+        } else {
+          return Status::InvalidArgument(
+              "Found options incompatible with filesystem", error_msg);
+        }
+      }
+    }
   }
 
   Status s = versions_->Recover(column_families, read_only);
@@ -498,7 +532,7 @@ Status DBImpl::RecoverLogFiles(const std::vector<uint64_t>& log_numbers,
     // The previous incarnation may not have written any MANIFEST
     // records after allocating this log number.  So we manually
     // update the file number allocation counter in VersionSet.
-    versions_->MarkFileNumberUsedDuringRecovery(log_number);
+    versions_->MarkFileNumberUsed(log_number);
     // Open the log file
     std::string fname = LogFileName(immutable_db_options_.wal_dir, log_number);
 
@@ -712,6 +746,12 @@ Status DBImpl::RecoverLogFiles(const std::vector<uint64_t>& log_numbers,
     }
 
     if (!status.ok()) {
+      if (status.IsNotSupported()) {
+        // We should not treat NotSupported as corruption. It is rather a clear
+        // sign that we are processing a WAL that is produced by an incompatible
+        // version of the code.
+        return status;
+      }
       if (immutable_db_options_.wal_recovery_mode ==
           WALRecoveryMode::kSkipAnyCorruptedRecords) {
         // We should ignore all errors unconditionally
@@ -739,7 +779,8 @@ Status DBImpl::RecoverLogFiles(const std::vector<uint64_t>& log_numbers,
     auto last_sequence = *next_sequence - 1;
     if ((*next_sequence != kMaxSequenceNumber) &&
         (versions_->LastSequence() <= last_sequence)) {
-      versions_->SetLastToBeWrittenSequence(last_sequence);
+      versions_->SetLastAllocatedSequence(last_sequence);
+      versions_->SetLastPublishedSequence(last_sequence);
       versions_->SetLastSequence(last_sequence);
     }
   }
@@ -817,7 +858,7 @@ Status DBImpl::RecoverLogFiles(const std::vector<uint64_t>& log_numbers,
       // not actually used. that is because VersionSet assumes
       // VersionSet::next_file_number_ always to be strictly greater than any
       // log number
-      versions_->MarkFileNumberUsedDuringRecovery(max_log_number + 1);
+      versions_->MarkFileNumberUsed(max_log_number + 1);
       status = versions_->LogAndApply(
           cfd, *cfd->GetLatestMutableCFOptions(), edit, &mutex_);
       if (!status.ok()) {
@@ -830,13 +871,13 @@ Status DBImpl::RecoverLogFiles(const std::vector<uint64_t>& log_numbers,
   if (data_seen && !flushed) {
     // Mark these as alive so they'll be considered for deletion later by
     // FindObsoleteFiles()
-    if (concurrent_prepare_) {
+    if (two_write_queues_) {
       log_write_mutex_.Lock();
     }
     for (auto log_number : log_numbers) {
       alive_log_files_.push_back(LogFileNumberSize(log_number));
     }
-    if (concurrent_prepare_) {
+    if (two_write_queues_) {
       log_write_mutex_.Unlock();
     }
   }
@@ -878,15 +919,16 @@ Status DBImpl::WriteLevel0TableForRecovery(int job_id, ColumnFamilyData* cfd,
     const uint64_t current_time = static_cast<uint64_t>(_current_time);
 
     {
+      auto write_hint = cfd->CalculateSSTWriteHint(0);
       mutex_.Unlock();
 
       SequenceNumber earliest_write_conflict_snapshot;
       std::vector<SequenceNumber> snapshot_seqs =
           snapshots_.GetAll(&earliest_write_conflict_snapshot);
-      // Only TransactionDB passes snapshot_checker and it creates it after db
-      // open. Just pass nullptr here.
-      SnapshotChecker* snapshot_checker = nullptr;
-
+      auto snapshot_checker = snapshot_checker_.get();
+      if (use_custom_gc_ && snapshot_checker == nullptr) {
+        snapshot_checker = DisableGCSnapshotChecker::Instance();
+      }
       s = BuildTable(
           dbname_, env_, *cfd->ioptions(), mutable_cf_options,
           env_options_for_compaction_, cfd->table_cache(), iter.get(),
@@ -898,7 +940,7 @@ Status DBImpl::WriteLevel0TableForRecovery(int job_id, ColumnFamilyData* cfd,
           cfd->ioptions()->compression_opts, paranoid_file_checks,
           cfd->internal_stats(), TableFileCreationReason::kRecovery,
           &event_logger_, job_id, Env::IO_HIGH, nullptr /* table_properties */,
-          -1 /* level */, current_time);
+          -1 /* level */, current_time, write_hint);
       LogFlush(immutable_db_options_.info_log);
       ROCKS_LOG_DEBUG(immutable_db_options_.info_log,
                       "[%s] [WriteLevel0TableForRecovery]"
@@ -951,6 +993,15 @@ Status DB::Open(const Options& options, const std::string& dbname, DB** dbptr) {
 Status DB::Open(const DBOptions& db_options, const std::string& dbname,
                 const std::vector<ColumnFamilyDescriptor>& column_families,
                 std::vector<ColumnFamilyHandle*>* handles, DB** dbptr) {
+  const bool seq_per_batch = true;
+  return DBImpl::Open(db_options, dbname, column_families, handles, dbptr,
+                      !seq_per_batch);
+}
+
+Status DBImpl::Open(const DBOptions& db_options, const std::string& dbname,
+                    const std::vector<ColumnFamilyDescriptor>& column_families,
+                    std::vector<ColumnFamilyHandle*>* handles, DB** dbptr,
+                    const bool seq_per_batch) {
   Status s = SanitizeOptionsByTable(db_options, column_families);
   if (!s.ok()) {
     return s;
@@ -970,7 +1021,7 @@ Status DB::Open(const DBOptions& db_options, const std::string& dbname,
         std::max(max_write_buffer_size, cf.options.write_buffer_size);
   }
 
-  DBImpl* impl = new DBImpl(db_options, dbname);
+  DBImpl* impl = new DBImpl(db_options, dbname, seq_per_batch);
   s = impl->env_->CreateDirIfMissing(impl->immutable_db_options_.wal_dir);
   if (s.ok()) {
     for (auto db_path : impl->immutable_db_options_.db_paths) {
@@ -992,6 +1043,7 @@ Status DB::Open(const DBOptions& db_options, const std::string& dbname,
     return s;
   }
   impl->mutex_.Lock();
+  auto write_hint = impl->CalculateWALWriteHint();
   // Handles create_if_missing, error_if_exists
   s = impl->Recover(column_families);
   if (s.ok()) {
@@ -1007,6 +1059,7 @@ Status DB::Open(const DBOptions& db_options, const std::string& dbname,
         LogFileName(impl->immutable_db_options_.wal_dir, new_log_number),
         &lfile, opt_env_options);
     if (s.ok()) {
+      lfile->SetWriteLifeTimeHint(write_hint);
       lfile->SetPreallocationBlockSize(
           impl->GetWalPreallocateBlockSize(max_write_buffer_size));
       {
@@ -1055,12 +1108,12 @@ Status DB::Open(const DBOptions& db_options, const std::string& dbname,
             cfd, &sv_context, *cfd->GetLatestMutableCFOptions());
       }
       sv_context.Clean();
-      if (impl->concurrent_prepare_) {
+      if (impl->two_write_queues_) {
         impl->log_write_mutex_.Lock();
       }
       impl->alive_log_files_.push_back(
           DBImpl::LogFileNumberSize(impl->logfile_number_));
-      if (impl->concurrent_prepare_) {
+      if (impl->two_write_queues_) {
         impl->log_write_mutex_.Unlock();
       }
       impl->DeleteObsoleteFiles();

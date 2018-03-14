@@ -77,6 +77,21 @@ enum class CompactionReason {
   kManualCompaction,
   // DB::SuggestCompactRange() marked files for compaction
   kFilesMarkedForCompaction,
+  // [Level] Automatic compaction within bottommost level to cleanup duplicate
+  // versions of same user key, usually due to a released snapshot.
+  kBottommostFiles,
+};
+
+enum class FlushReason : int {
+  kUnknown = 0x00,
+  kGetLiveFiles = 0x01,
+  kShutDown = 0x02,
+  kExternalFileIngestion = 0x03,
+  kManualCompaction = 0x04,
+  kWriteBufferManager = 0x05,
+  kWriteBufferFull = 0x06,
+  kTest = 0x07,
+  kSuperVersionChange = 0x08,
 };
 
 enum class BackgroundErrorReason {
@@ -140,6 +155,8 @@ struct FlushJobInfo {
   SequenceNumber largest_seqno;
   // Table properties of the table being flushed
   TableProperties table_properties;
+
+  FlushReason flush_reason;
 };
 
 struct CompactionJobInfo {
@@ -208,30 +225,6 @@ struct ExternalFileIngestionInfo {
   SequenceNumber global_seqno;
   // Table properties of the table being flushed
   TableProperties table_properties;
-};
-
-// A call-back function to RocksDB which will be called when the compaction
-// iterator is compacting values. It is mean to be returned from
-// EventListner::GetCompactionEventListner() at the beginning of compaction
-// job.
-class CompactionEventListener {
- public:
-  enum CompactionListenerValueType {
-    kValue,
-    kMergeOperand,
-    kDelete,
-    kSingleDelete,
-    kRangeDelete,
-    kBlobIndex,
-    kInvalid,
-  };
-
-  virtual void OnCompaction(int level, const Slice& key,
-                            CompactionListenerValueType value_type,
-                            const Slice& existing_value,
-                            const SequenceNumber& sn, bool is_new) = 0;
-
-  virtual ~CompactionEventListener() = default;
 };
 
 // EventListener class contains a set of call-back functions that will
@@ -362,8 +355,8 @@ class EventListener {
   // returns.  Otherwise, RocksDB may be blocked.
   // @param handle is a pointer to the column family handle to be deleted
   // which will become a dangling pointer after the deletion.
-  virtual void OnColumnFamilyHandleDeletionStarted(ColumnFamilyHandle* handle) {
-  }
+  virtual void OnColumnFamilyHandleDeletionStarted(
+      ColumnFamilyHandle* /*handle*/) {}
 
   // A call-back function for RocksDB which will be called after an external
   // file is ingested using IngestExternalFile.
@@ -395,12 +388,6 @@ class EventListener {
   // it should not run for an extended period of time before the function
   // returns.  Otherwise, RocksDB may be blocked.
   virtual void OnStallConditionsChanged(const WriteStallInfo& /*info*/) {}
-
-  // Factory method to return CompactionEventListener. If multiple listeners
-  // provides CompactionEventListner, only the first one will be used.
-  virtual CompactionEventListener* GetCompactionEventListener() {
-    return nullptr;
-  }
 
   virtual ~EventListener() {}
 };
