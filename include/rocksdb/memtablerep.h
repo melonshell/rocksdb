@@ -39,17 +39,19 @@
 #include <stdexcept>
 #include <stdint.h>
 #include <stdlib.h>
+#include <rocksdb/slice.h>
 
 namespace rocksdb {
 
 class Arena;
 class Allocator;
 class LookupKey;
-class Slice;
 class SliceTransform;
 class Logger;
 
 typedef void* KeyHandle;
+
+extern Slice GetLengthPrefixedSlice(const char* data);
 
 class MemTableRep {
  public:
@@ -57,6 +59,14 @@ class MemTableRep {
   // concatenated with values.
   class KeyComparator {
    public:
+    typedef rocksdb::Slice DecodedType;
+
+    virtual DecodedType decode_key(const char* key) const {
+      // The format of key is frozen and can be terated as a part of the API
+      // contract. Refer to MemTable::Add for details.
+      return GetLengthPrefixedSlice(key);
+    }
+
     // Compare a and b. Return a negative value if a is less than b, 0 if they
     // are equal, and a positive value if a is greater than b
     virtual int operator()(const char* prefix_len_key1,
@@ -133,6 +143,14 @@ class MemTableRep {
   // not be written to (ie No more calls to Allocate(), Insert(),
   // or any writes done directly to entries accessed through the iterator.)
   virtual void MarkReadOnly() { }
+
+  // Notify this table rep that it has been flushed to stable storage.
+  // By default, does nothing.
+  //
+  // Invariant: MarkReadOnly() is called, before MarkFlushed().
+  // Note that this method if overridden, should not run for an extended period
+  // of time. Otherwise, RocksDB may be blocked.
+  virtual void MarkFlushed() { }
 
   // Look up key from the mem table, since the first key in the mem table whose
   // user_key matches the one given k, call the function callback_func(), with

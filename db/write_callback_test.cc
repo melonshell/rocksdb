@@ -29,7 +29,7 @@ class WriteCallbackTest : public testing::Test {
   string dbname;
 
   WriteCallbackTest() {
-    dbname = test::TmpDir() + "/write_callback_testdb";
+    dbname = test::PerThreadDBPath("write_callback_testdb");
   }
 };
 
@@ -157,8 +157,9 @@ TEST_F(WriteCallbackTest, WriteWithCallbackTest) {
               column_families.push_back(
                   ColumnFamilyDescriptor(kDefaultColumnFamilyName, cf_options));
               std::vector<ColumnFamilyHandle*> handles;
-              auto open_s = DBImpl::Open(db_options, dbname, column_families,
-                                         &handles, &db, seq_per_batch);
+              auto open_s =
+                  DBImpl::Open(db_options, dbname, column_families, &handles,
+                               &db, seq_per_batch, true /* batch_per_txn */);
               ASSERT_OK(open_s);
               assert(handles.size() == 1);
               delete handles[0];
@@ -294,7 +295,8 @@ TEST_F(WriteCallbackTest, WriteWithCallbackTest) {
                    public:
                     PublishSeqCallback(DBImpl* db_impl_in)
                         : db_impl_(db_impl_in) {}
-                    virtual Status Callback(SequenceNumber last_seq) {
+                    virtual Status Callback(SequenceNumber last_seq,
+                                            bool /*not used*/) override {
                       db_impl_->SetLastPublishedSequence(last_seq);
                       return Status::OK();
                     }
@@ -431,7 +433,7 @@ int main(int argc, char** argv) {
 #else
 #include <stdio.h>
 
-int main(int argc, char** argv) {
+int main(int /*argc*/, char** /*argv*/) {
   fprintf(stderr,
           "SKIPPED as WriteWithCallback is not supported in ROCKSDB_LITE\n");
   return 0;

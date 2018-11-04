@@ -43,7 +43,7 @@ class TtlTest : public testing::Test {
  public:
   TtlTest() {
     env_.reset(new SpecialTimeEnv(Env::Default()));
-    dbname_ = test::TmpDir() + "/db_ttl";
+    dbname_ = test::PerThreadDBPath("db_ttl");
     options_.create_if_missing = true;
     options_.env = env_.get();
     // ensure that compaction is kicked in to always strip timestamp from kvs
@@ -655,7 +655,7 @@ int main(int argc, char** argv) {
 #else
 #include <stdio.h>
 
-int main(int argc, char** argv) {
+int main(int /*argc*/, char** /*argv*/) {
   fprintf(stderr, "SKIPPED as DBWithTTL is not supported in ROCKSDB_LITE\n");
   return 0;
 }

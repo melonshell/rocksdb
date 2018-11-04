@@ -45,6 +45,7 @@ class DBTestCompactionFilterWithCompactParam
   }
 };
 
+#ifndef ROCKSDB_VALGRIND_RUN
 INSTANTIATE_TEST_CASE_P(
     DBTestCompactionFilterWithCompactOption,
     DBTestCompactionFilterWithCompactParam,
@@ -53,6 +54,12 @@ INSTANTIATE_TEST_CASE_P(
                       DBTestBase::OptionConfig::kUniversalCompactionMultiLevel,
                       DBTestBase::OptionConfig::kLevelSubcompactions,
                       DBTestBase::OptionConfig::kUniversalSubcompactions));
+#else
+// Run fewer cases in valgrind
+INSTANTIATE_TEST_CASE_P(DBTestCompactionFilterWithCompactOption,
+                        DBTestCompactionFilterWithCompactParam,
+                        ::testing::Values(DBTestBase::OptionConfig::kDefault));
+#endif  // ROCKSDB_VALGRIND_RUN
 
 class KeepFilter : public CompactionFilter {
  public:
@@ -109,7 +116,7 @@ class SkipEvenFilter : public CompactionFilter {
     int i = std::stoi(key.ToString());
     if (i / 10 % 2 == 0) {
       char key_str[100];
-      snprintf(key_str, sizeof(key), "%010d", i / 10 * 10 + 10);
+      snprintf(key_str, sizeof(key_str), "%010d", i / 10 * 10 + 10);
       *skip_until = key_str;
       ++cfilter_skips;
       return Decision::kRemoveAndSkipUntil;

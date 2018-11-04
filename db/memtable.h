@@ -34,7 +34,6 @@ namespace rocksdb {
 class Mutex;
 class MemTableIterator;
 class MergeContext;
-class InternalIterator;
 
 struct ImmutableMemTableOptions {
   explicit ImmutableMemTableOptions(const ImmutableCFOptions& ioptions,
@@ -64,7 +63,7 @@ struct MemTablePostProcessInfo {
 };
 
 // Note:  Many of the methods in this class have comments indicating that
-// external synchromization is required as these methods are not thread-safe.
+// external synchronization is required as these methods are not thread-safe.
 // It is up to higher layers of code to decide how to prevent concurrent
 // invokation of these methods.  This is usually done by acquiring either
 // the db mutex or the single writer thread.
@@ -84,7 +83,7 @@ class MemTable {
     virtual int operator()(const char* prefix_len_key1,
                            const char* prefix_len_key2) const override;
     virtual int operator()(const char* prefix_len_key,
-                           const Slice& key) const override;
+                           const DecodedType& key) const override;
   };
 
   // MemTables are reference counted.  The initial reference count
@@ -188,17 +187,19 @@ class MemTable {
   // On success, *s may be set to OK, NotFound, or MergeInProgress.  Any other
   // status returned indicates a corruption or other unexpected error.
   bool Get(const LookupKey& key, std::string* value, Status* s,
-           MergeContext* merge_context, RangeDelAggregator* range_del_agg,
-           SequenceNumber* seq, const ReadOptions& read_opts,
-           ReadCallback* callback = nullptr, bool* is_blob_index = nullptr);
+           MergeContext* merge_context,
+           SequenceNumber* max_covering_tombstone_seq, SequenceNumber* seq,
+           const ReadOptions& read_opts, ReadCallback* callback = nullptr,
+           bool* is_blob_index = nullptr);
 
   bool Get(const LookupKey& key, std::string* value, Status* s,
-           MergeContext* merge_context, RangeDelAggregator* range_del_agg,
+           MergeContext* merge_context,
+           SequenceNumber* max_covering_tombstone_seq,
            const ReadOptions& read_opts, ReadCallback* callback = nullptr,
            bool* is_blob_index = nullptr) {
     SequenceNumber seq;
-    return Get(key, value, s, merge_context, range_del_agg, &seq, read_opts,
-               callback, is_blob_index);
+    return Get(key, value, s, merge_context, max_covering_tombstone_seq, &seq,
+               read_opts, callback, is_blob_index);
   }
 
   // Attempts to update the new_value inplace, else does normal Add
@@ -337,6 +338,14 @@ class MemTable {
     mem_tracker_.DoneAllocating();
   }
 
+  // Notify the underlying storage that all data it contained has been
+  // persisted.
+  // REQUIRES: external synchronization to prevent simultaneous
+  // operations on the same MemTable.
+  void MarkFlushed() {
+    table_->MarkFlushed();
+  }
+
   // return true if the current MemTableRep supports merge operator.
   bool IsMergeOperatorSupported() const {
     return table_->IsMergeOperatorSupported();
@@ -375,6 +384,14 @@ class MemTable {
   void SetID(uint64_t id) { id_ = id; }
 
   uint64_t GetID() const { return id_; }
+
+  SequenceNumber& TEST_AtomicFlushSequenceNumber() {
+    return atomic_flush_seqno_;
+  }
+
+  void TEST_SetFlushCompleted(bool completed) { flush_completed_ = completed; }
+
+  void TEST_SetFileNumber(uint64_t file_num) { file_number_ = file_num; }
 
  private:
   enum FlushStateEnum { FLUSH_NOT_REQUESTED, FLUSH_REQUESTED, FLUSH_SCHEDULED };
@@ -447,6 +464,12 @@ class MemTable {
 
   // Memtable id to track flush.
   uint64_t id_ = 0;
+
+  // Sequence number of the atomic flush that is responsible for this memtable.
+  // The sequence number of atomic flush is a seq, such that no writes with
+  // sequence numbers greater than or equal to seq are flushed, while all
+  // writes with sequence number smaller than seq are flushed.
+  SequenceNumber atomic_flush_seqno_;
 
   // Returns a heuristic flush decision
   bool ShouldFlushNow() const;

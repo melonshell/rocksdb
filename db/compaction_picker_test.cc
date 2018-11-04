@@ -59,7 +59,7 @@ class CompactionPickerTest : public testing::Test {
         vstorage_(nullptr) {
     fifo_options_.max_table_files_size = 1;
     mutable_cf_options_.RefreshDerivedOptions(ioptions_);
-    ioptions_.db_paths.emplace_back("dummy",
+    ioptions_.cf_paths.emplace_back("dummy",
                                     std::numeric_limits<uint64_t>::max());
   }
 
@@ -90,8 +90,8 @@ class CompactionPickerTest : public testing::Test {
     f->fd = FileDescriptor(file_number, path_id, file_size);
     f->smallest = InternalKey(smallest, smallest_seq, kTypeValue);
     f->largest = InternalKey(largest, largest_seq, kTypeValue);
-    f->smallest_seqno = smallest_seq;
-    f->largest_seqno = largest_seq;
+    f->fd.smallest_seqno = smallest_seq;
+    f->fd.largest_seqno = largest_seq;
     f->compensated_file_size = file_size;
     f->refs = 0;
     vstorage_->AddFile(level, f);
@@ -391,10 +391,10 @@ TEST_F(CompactionPickerTest, NeedsCompactionUniversal) {
   NewVersionStorage(1, kCompactionStyleUniversal);
   UniversalCompactionPicker universal_compaction_picker(
       ioptions_, &icmp_);
+  UpdateVersionStorageInfo();
   // must return false when there's no files.
   ASSERT_EQ(universal_compaction_picker.NeedsCompaction(vstorage_.get()),
             false);
-  UpdateVersionStorageInfo();
 
   // verify the trigger given different number of L0 files.
   for (int i = 1;
@@ -415,6 +415,7 @@ TEST_F(CompactionPickerTest, CompactionUniversalIngestBehindReservedLevel) {
   ioptions_.allow_ingest_behind = true;
   ioptions_.num_levels = 3;
   UniversalCompactionPicker universal_compaction_picker(ioptions_, &icmp_);
+  UpdateVersionStorageInfo();
   // must return false when there's no files.
   ASSERT_EQ(universal_compaction_picker.NeedsCompaction(vstorage_.get()),
             false);
@@ -448,6 +449,7 @@ TEST_F(CompactionPickerTest, CannotTrivialMoveUniversal) {
   mutable_cf_options_.compaction_options_universal.allow_trivial_move = true;
   NewVersionStorage(1, kCompactionStyleUniversal);
   UniversalCompactionPicker universal_compaction_picker(ioptions_, &icmp_);
+  UpdateVersionStorageInfo();
   // must return false when there's no files.
   ASSERT_EQ(universal_compaction_picker.NeedsCompaction(vstorage_.get()),
             false);

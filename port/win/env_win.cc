@@ -102,7 +102,8 @@ WinEnvIO::~WinEnvIO() {
 Status WinEnvIO::DeleteFile(const std::string& fname) {
   Status result;
 
-  BOOL ret = DeleteFileA(fname.c_str());
+  BOOL ret = RX_DeleteFile(RX_FN(fname).c_str());
+
   if(!ret) {
     auto lastError = GetLastError();
     result = IOErrorFromWindowsError("Failed to delete: " + fname,
@@ -110,6 +111,15 @@ Status WinEnvIO::DeleteFile(const std::string& fname) {
   }
 
   return result;
+}
+
+Status WinEnvIO::Truncate(const std::string& fname, size_t size) {
+  Status s;
+  int result = rocksdb::port::Truncate(fname, size);
+  if (result != 0) {
+    s = IOError("Failed to truncate: " + fname, errno);
+  }
+  return s;
 }
 
 Status WinEnvIO::GetCurrentTime(int64_t* unix_time) {
@@ -142,8 +152,8 @@ Status WinEnvIO::NewSequentialFile(const std::string& fname,
 
   {
     IOSTATS_TIMER_GUARD(open_nanos);
-    hFile = CreateFileA(
-      fname.c_str(), GENERIC_READ,
+    hFile = RX_CreateFile(
+      RX_FN(fname).c_str(), GENERIC_READ,
       FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE, NULL,
       OPEN_EXISTING,  // Original fopen mode is "rb"
       fileFlags, NULL);
@@ -181,7 +191,7 @@ Status WinEnvIO::NewRandomAccessFile(const std::string& fname,
   {
     IOSTATS_TIMER_GUARD(open_nanos);
     hFile =
-      CreateFileA(fname.c_str(), GENERIC_READ,
+      RX_CreateFile(RX_FN(fname).c_str(), GENERIC_READ,
       FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE,
       NULL, OPEN_EXISTING, fileFlags, NULL);
   }
@@ -208,7 +218,7 @@ Status WinEnvIO::NewRandomAccessFile(const std::string& fname,
           "NewRandomAccessFile failed to map empty file: " + fname, EINVAL);
       }
 
-      HANDLE hMap = CreateFileMappingA(hFile, NULL, PAGE_READONLY,
+      HANDLE hMap = RX_CreateFileMapping(hFile, NULL, PAGE_READONLY,
         0,  // Whole file at its present length
         0,
         NULL);  // Mapping name
@@ -226,7 +236,7 @@ Status WinEnvIO::NewRandomAccessFile(const std::string& fname,
         MapViewOfFileEx(hMap, FILE_MAP_READ,
         0,  // High DWORD of access start
         0,  // Low DWORD
-        fileSize,
+        static_cast<SIZE_T>(fileSize),
         NULL);  // Let the OS choose the mapping
 
       if (!mapped_region) {
@@ -237,7 +247,7 @@ Status WinEnvIO::NewRandomAccessFile(const std::string& fname,
       }
 
       result->reset(new WinMmapReadableFile(fname, hFile, hMap, mapped_region,
-        fileSize));
+				static_cast<size_t>(fileSize)));
 
       mapGuard.release();
       fileGuard.release();
@@ -293,8 +303,8 @@ Status WinEnvIO::OpenWritableFile(const std::string& fname,
   HANDLE hFile = 0;
   {
     IOSTATS_TIMER_GUARD(open_nanos);
-    hFile = CreateFileA(
-      fname.c_str(),
+    hFile = RX_CreateFile(
+      RX_FN(fname).c_str(),
       desired_access,  // Access desired
       shared_mode,
       NULL,           // Security attributes
@@ -344,7 +354,7 @@ Status WinEnvIO::NewRandomRWFile(const std::string & fname,
   // Random access is to disable read-ahead as the system reads too much data
   DWORD desired_access = GENERIC_READ | GENERIC_WRITE;
   DWORD shared_mode = FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE;
-  DWORD creation_disposition = OPEN_ALWAYS; // Create if necessary or open existing
+  DWORD creation_disposition = OPEN_EXISTING; // Fail if file does not exist
   DWORD file_flags = FILE_FLAG_RANDOM_ACCESS;
 
   if (options.use_direct_reads && options.use_direct_writes) {
@@ -357,7 +367,7 @@ Status WinEnvIO::NewRandomRWFile(const std::string & fname,
   {
     IOSTATS_TIMER_GUARD(open_nanos);
     hFile =
-      CreateFileA(fname.c_str(),
+      RX_CreateFile(RX_FN(fname).c_str(),
         desired_access,
         shared_mode,
         NULL, // Security attributes
@@ -380,6 +390,84 @@ Status WinEnvIO::NewRandomRWFile(const std::string & fname,
   return s;
 }
 
+Status WinEnvIO::NewMemoryMappedFileBuffer(const std::string & fname,
+  std::unique_ptr<MemoryMappedFileBuffer>* result) {
+  Status s;
+  result->reset();
+
+  DWORD fileFlags = FILE_ATTRIBUTE_READONLY;
+
+  HANDLE hFile = INVALID_HANDLE_VALUE;
+  {
+    IOSTATS_TIMER_GUARD(open_nanos);
+    hFile = RX_CreateFile(
+      RX_FN(fname).c_str(), GENERIC_READ | GENERIC_WRITE,
+      FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE,
+      NULL,
+      OPEN_EXISTING,  // Open only if it exists
+      fileFlags,
+      NULL);
+  }
+
+  if (INVALID_HANDLE_VALUE == hFile) {
+    auto lastError = GetLastError();
+    s = IOErrorFromWindowsError("Failed to open NewMemoryMappedFileBuffer: " + fname,
+      lastError);
+    return s;
+  }
+  UniqueCloseHandlePtr fileGuard(hFile, CloseHandleFunc);
+
+  uint64_t fileSize = 0;
+  s = GetFileSize(fname, &fileSize);
+  if (!s.ok()) {
+    return s;
+  }
+  // Will not map empty files
+  if (fileSize == 0) {
+    return Status::NotSupported("NewMemoryMappedFileBuffer can not map zero length files: " + fname);
+  }
+
+  // size_t is 32-bit with 32-bit builds
+  if (fileSize > std::numeric_limits<size_t>::max()) {
+    return Status::NotSupported(
+      "The specified file size does not fit into 32-bit memory addressing: " + fname);
+  }
+
+  HANDLE hMap = RX_CreateFileMapping(hFile, NULL, PAGE_READWRITE,
+      0,  // Whole file at its present length
+      0,
+      NULL);  // Mapping name
+
+  if (!hMap) {
+    auto lastError = GetLastError();
+    return IOErrorFromWindowsError(
+      "Failed to create file mapping for NewMemoryMappedFileBuffer: " + fname,
+      lastError);
+  }
+  UniqueCloseHandlePtr mapGuard(hMap, CloseHandleFunc);
+
+  void* base = MapViewOfFileEx(hMap, FILE_MAP_WRITE,
+    0,  // High DWORD of access start
+    0,  // Low DWORD
+		static_cast<SIZE_T>(fileSize),
+    NULL);  // Let the OS choose the mapping
+
+  if (!base) {
+    auto lastError = GetLastError();
+    return IOErrorFromWindowsError(
+      "Failed to MapViewOfFile for NewMemoryMappedFileBuffer: " + fname,
+      lastError);
+  }
+
+  result->reset(new WinMemoryMappedBuffer(hFile, hMap, 
+    base, static_cast<size_t>(fileSize)));
+
+  mapGuard.release();
+  fileGuard.release();
+
+  return s;
+}
+
 Status WinEnvIO::NewDirectory(const std::string& name,
   std::unique_ptr<Directory>* result) {
   Status s;
@@ -396,7 +484,7 @@ Status WinEnvIO::NewDirectory(const std::string& name,
   // 0 - for access means read metadata
   {
     IOSTATS_TIMER_GUARD(open_nanos);
-    handle = ::CreateFileA(name.c_str(), 0,
+    handle = RX_CreateFile(RX_FN(name).c_str(), 0,
       FILE_SHARE_DELETE | FILE_SHARE_READ | FILE_SHARE_WRITE,
       NULL,
       OPEN_EXISTING,
@@ -422,8 +510,7 @@ Status WinEnvIO::FileExists(const std::string& fname) {
   // which is consistent with _access() impl on windows
   // but can be added
   WIN32_FILE_ATTRIBUTE_DATA attrs;
-  if (FALSE == GetFileAttributesExA(fname.c_str(), GetFileExInfoStandard,
-    &attrs)) {
+  if (FALSE == RX_GetFileAttributesEx(RX_FN(fname).c_str(), GetFileExInfoStandard, &attrs)) {
     auto lastError = GetLastError();
     switch (lastError) {
     case ERROR_ACCESS_DENIED:
@@ -448,11 +535,12 @@ Status WinEnvIO::GetChildren(const std::string& dir,
   result->clear();
   std::vector<std::string> output;
 
-  WIN32_FIND_DATA data;
+  RX_WIN32_FIND_DATA data;
+  memset(&data, 0, sizeof(data));
   std::string pattern(dir);
   pattern.append("\\").append("*");
 
-  HANDLE handle = ::FindFirstFileExA(pattern.c_str(),
+  HANDLE handle = RX_FindFirstFileEx(RX_FN(pattern).c_str(),
     FindExInfoBasic, // Do not want alternative name
     &data,
     FindExSearchNameMatch,
@@ -485,8 +573,9 @@ Status WinEnvIO::GetChildren(const std::string& dir,
   data.cFileName[MAX_PATH - 1] = 0;
 
   while (true) {
-    output.emplace_back(data.cFileName);
-    BOOL ret =- ::FindNextFileA(handle, &data);
+    auto x = RX_FILESTRING(data.cFileName, RX_FNLEN(data.cFileName));
+    output.emplace_back(FN_TO_RX(x));
+    BOOL ret =- RX_FindNextFile(handle, &data);
     // If the function fails the return value is zero
     // and non-zero otherwise. Not TRUE or FALSE.
     if (ret == FALSE) {
@@ -501,8 +590,7 @@ Status WinEnvIO::GetChildren(const std::string& dir,
 
 Status WinEnvIO::CreateDir(const std::string& name) {
   Status result;
-
-  BOOL ret = CreateDirectoryA(name.c_str(), NULL);
+  BOOL ret = RX_CreateDirectory(RX_FN(name).c_str(), NULL);
   if (!ret) {
     auto lastError = GetLastError();
     result = IOErrorFromWindowsError(
@@ -515,15 +603,19 @@ Status WinEnvIO::CreateDir(const std::string& name) {
 Status  WinEnvIO::CreateDirIfMissing(const std::string& name) {
   Status result;
 
-  BOOL ret = CreateDirectoryA(name.c_str(), NULL);
+  if (DirExists(name)) {
+    return result;
+  }
+
+  BOOL ret = RX_CreateDirectory(RX_FN(name).c_str(), NULL);
   if (!ret) {
     auto lastError = GetLastError();
     if (lastError != ERROR_ALREADY_EXISTS) {
       result = IOErrorFromWindowsError(
         "Failed to create a directory: " + name, lastError);
-    } else if (!DirExists(name)) {
+    } else {
       result =
-        Status::IOError("`" + name + "' exists but is not a directory");
+        Status::IOError(name + ": exists but is not a directory");
     }
   }
   return result;
@@ -531,7 +623,7 @@ Status  WinEnvIO::CreateDirIfMissing(const std::string& name) {
 
 Status WinEnvIO::DeleteDir(const std::string& name) {
   Status result;
-  BOOL ret = RemoveDirectoryA(name.c_str());
+  BOOL ret = RX_RemoveDirectory(RX_FN(name).c_str());
   if (!ret) {
     auto lastError = GetLastError();
     result = IOErrorFromWindowsError("Failed to remove dir: " + name, lastError);
@@ -544,7 +636,7 @@ Status WinEnvIO::GetFileSize(const std::string& fname,
   Status s;
 
   WIN32_FILE_ATTRIBUTE_DATA attrs;
-  if (GetFileAttributesExA(fname.c_str(), GetFileExInfoStandard, &attrs)) {
+  if (RX_GetFileAttributesEx(RX_FN(fname).c_str(), GetFileExInfoStandard, &attrs)) {
     ULARGE_INTEGER file_size;
     file_size.HighPart = attrs.nFileSizeHigh;
     file_size.LowPart = attrs.nFileSizeLow;
@@ -579,7 +671,7 @@ Status WinEnvIO::GetFileModificationTime(const std::string& fname,
   Status s;
 
   WIN32_FILE_ATTRIBUTE_DATA attrs;
-  if (GetFileAttributesExA(fname.c_str(), GetFileExInfoStandard, &attrs)) {
+  if (RX_GetFileAttributesEx(RX_FN(fname).c_str(), GetFileExInfoStandard, &attrs)) {
     *file_mtime = FileTimeToUnixTime(attrs.ftLastWriteTime);
   } else {
     auto lastError = GetLastError();
@@ -597,7 +689,7 @@ Status WinEnvIO::RenameFile(const std::string& src,
 
   // rename() is not capable of replacing the existing file as on Linux
   // so use OS API directly
-  if (!MoveFileExA(src.c_str(), target.c_str(), MOVEFILE_REPLACE_EXISTING)) {
+  if (!RX_MoveFileEx(RX_FN(src).c_str(), RX_FN(target).c_str(), MOVEFILE_REPLACE_EXISTING)) {
     DWORD lastError = GetLastError();
 
     std::string text("Failed to rename: ");
@@ -613,8 +705,11 @@ Status WinEnvIO::LinkFile(const std::string& src,
   const std::string& target) {
   Status result;
 
-  if (!CreateHardLinkA(target.c_str(), src.c_str(), NULL)) {
+  if (!RX_CreateHardLink(RX_FN(target).c_str(), RX_FN(src).c_str(),  NULL)) {
     DWORD lastError = GetLastError();
+    if (lastError == ERROR_NOT_SAME_DEVICE) {
+      return Status::NotSupported("No cross FS links allowed");
+    }
 
     std::string text("Failed to link: ");
     text.append(src).append(" to: ").append(target);
@@ -623,6 +718,32 @@ Status WinEnvIO::LinkFile(const std::string& src,
   }
 
   return result;
+}
+
+Status WinEnvIO::NumFileLinks(const std::string& fname, uint64_t* count) {
+  Status s;
+  HANDLE handle = RX_CreateFile(
+      RX_FN(fname).c_str(), 0,
+      FILE_SHARE_DELETE | FILE_SHARE_READ | FILE_SHARE_WRITE,
+      NULL, OPEN_EXISTING, FILE_FLAG_BACKUP_SEMANTICS, NULL);
+
+  if (INVALID_HANDLE_VALUE == handle) {
+    auto lastError = GetLastError();
+    s = IOErrorFromWindowsError("NumFileLinks: " + fname, lastError);
+    return s;
+  }
+  UniqueCloseHandlePtr handle_guard(handle, CloseHandleFunc);
+  FILE_STANDARD_INFO standard_info;
+  if (0 != GetFileInformationByHandleEx(handle, FileStandardInfo,
+                                        &standard_info,
+                                        sizeof(standard_info))) {
+    *count = standard_info.NumberOfLinks;
+  } else {
+    auto lastError = GetLastError();
+    s = IOErrorFromWindowsError("GetFileInformationByHandleEx: " + fname,
+                                lastError);
+  }
+  return s;
 }
 
 Status WinEnvIO::AreFilesSame(const std::string& first,
@@ -639,7 +760,7 @@ Status WinEnvIO::AreFilesSame(const std::string& first,
   }
 
   // 0 - for access means read metadata
-  HANDLE file_1 = ::CreateFileA(first.c_str(), 0, 
+  HANDLE file_1 = RX_CreateFile(RX_FN(first).c_str(), 0, 
                       FILE_SHARE_DELETE | FILE_SHARE_READ | FILE_SHARE_WRITE,
                       NULL, 
                       OPEN_EXISTING,
@@ -654,7 +775,7 @@ Status WinEnvIO::AreFilesSame(const std::string& first,
   }
   UniqueCloseHandlePtr g_1(file_1, CloseHandleFunc);
 
-  HANDLE file_2 = ::CreateFileA(second.c_str(), 0,
+  HANDLE file_2 = RX_CreateFile(RX_FN(second).c_str(), 0,
                      FILE_SHARE_DELETE | FILE_SHARE_READ | FILE_SHARE_WRITE,
                      NULL, OPEN_EXISTING,
                      FILE_FLAG_BACKUP_SEMANTICS, // make opening folders possible
@@ -716,7 +837,7 @@ Status  WinEnvIO::LockFile(const std::string& lockFname,
   HANDLE hFile = 0;
   {
     IOSTATS_TIMER_GUARD(open_nanos);
-    hFile = CreateFileA(lockFname.c_str(), (GENERIC_READ | GENERIC_WRITE),
+    hFile = RX_CreateFile(RX_FN(lockFname).c_str(), (GENERIC_READ | GENERIC_WRITE),
       ExclusiveAccessON, NULL, CREATE_ALWAYS,
       FILE_ATTRIBUTE_NORMAL, NULL);
   }
@@ -779,8 +900,8 @@ Status WinEnvIO::NewLogger(const std::string& fname,
   HANDLE hFile = 0;
   {
     IOSTATS_TIMER_GUARD(open_nanos);
-    hFile = CreateFileA(
-      fname.c_str(), GENERIC_WRITE,
+    hFile = RX_CreateFile(
+      RX_FN(fname).c_str(), GENERIC_WRITE,
       FILE_SHARE_READ | FILE_SHARE_DELETE,  // In RocksDb log files are
       // renamed and deleted before
       // they are closed. This enables
@@ -873,17 +994,17 @@ Status WinEnvIO::GetAbsolutePath(const std::string& db_path,
   // For test compatibility we will consider starting slash as an
   // absolute path
   if ((!db_path.empty() && (db_path[0] == '\\' || db_path[0] == '/')) ||
-    !PathIsRelativeA(db_path.c_str())) {
+    !RX_PathIsRelative(RX_FN(db_path).c_str())) {
     *output_path = db_path;
     return Status::OK();
   }
 
-  std::string result;
+  RX_FILESTRING result;
   result.resize(MAX_PATH);
 
   // Hopefully no changes the current directory while we do this
   // however _getcwd also suffers from the same limitation
-  DWORD len = GetCurrentDirectoryA(MAX_PATH, &result[0]);
+  DWORD len = RX_GetCurrentDirectory(MAX_PATH, &result[0]);
   if (len == 0) {
     auto lastError = GetLastError();
     return IOErrorFromWindowsError("Failed to get current working directory",
@@ -891,8 +1012,9 @@ Status WinEnvIO::GetAbsolutePath(const std::string& db_path,
   }
 
   result.resize(len);
-
-  result.swap(*output_path);
+  std::string res = FN_TO_RX(result);
+  
+  res.swap(*output_path);
   return Status::OK();
 }
 
@@ -924,34 +1046,40 @@ std::string WinEnvIO::TimeToString(uint64_t secondsSince1970) {
 
 EnvOptions WinEnvIO::OptimizeForLogWrite(const EnvOptions& env_options,
   const DBOptions& db_options) const {
-  EnvOptions optimized = env_options;
+  EnvOptions optimized(env_options);
+  // These two the same as default optimizations
   optimized.bytes_per_sync = db_options.wal_bytes_per_sync;
-  optimized.use_mmap_writes = false;
-  // This is because we flush only whole pages on unbuffered io and
-  // the last records are not guaranteed to be flushed.
-  optimized.use_direct_writes = false;
-  // TODO(icanadi) it's faster if fallocate_with_keep_size is false, but it
-  // breaks TransactionLogIteratorStallAtLastRecord unit test. Fix the unit
-  // test and make this false
-  optimized.fallocate_with_keep_size = true;
   optimized.writable_file_max_buffer_size =
       db_options.writable_file_max_buffer_size;
+
+  // This adversely affects %999 on windows
+  optimized.use_mmap_writes = false;
+  // Direct writes will produce a huge perf impact on
+  // Windows. Pre-allocate space for WAL.
+  optimized.use_direct_writes = false;
   return optimized;
 }
 
 EnvOptions WinEnvIO::OptimizeForManifestWrite(
   const EnvOptions& env_options) const {
-  EnvOptions optimized = env_options;
+  EnvOptions optimized(env_options);
   optimized.use_mmap_writes = false;
-  optimized.use_direct_writes = false;
-  optimized.fallocate_with_keep_size = true;
+  optimized.use_direct_reads = false;
+  return optimized;
+}
+
+EnvOptions WinEnvIO::OptimizeForManifestRead(
+  const EnvOptions& env_options) const {
+  EnvOptions optimized(env_options);
+  optimized.use_mmap_writes = false;
+  optimized.use_direct_reads = false;
   return optimized;
 }
 
 // Returns true iff the named directory exists and is a directory.
 bool WinEnvIO::DirExists(const std::string& dname) {
   WIN32_FILE_ATTRIBUTE_DATA attrs;
-  if (GetFileAttributesExA(dname.c_str(), GetFileExInfoStandard, &attrs)) {
+  if (RX_GetFileAttributesEx(RX_FN(dname).c_str(), GetFileExInfoStandard, &attrs)) {
     return 0 != (attrs.dwFileAttributes & FILE_ATTRIBUTE_DIRECTORY);
   }
   return false;
@@ -960,7 +1088,7 @@ bool WinEnvIO::DirExists(const std::string& dname) {
 size_t WinEnvIO::GetSectorSize(const std::string& fname) {
   size_t sector_size = kSectorSize;
 
-  if (PathIsRelativeA(fname.c_str())) {
+  if (RX_PathIsRelative(RX_FN(fname).c_str())) {
     return sector_size;
   }
 
@@ -1000,7 +1128,7 @@ size_t WinEnvIO::GetSectorSize(const std::string& fname) {
 
     DISK_GEOMETRY_EX geometry = { 0 };
     ret = DeviceIoControl(hDevice, IOCTL_DISK_GET_DRIVE_GEOMETRY,
-           nullptr, 0, &geometry, sizeof(geometry), nullptr, nullptr);
+           nullptr, 0, &geometry, sizeof(geometry), &output_bytes, nullptr);
     if (ret) {
       sector_size = geometry.Geometry.BytesPerSector;
     }
@@ -1141,6 +1269,10 @@ Status WinEnv::DeleteFile(const std::string& fname) {
   return winenv_io_.DeleteFile(fname);
 }
 
+Status WinEnv::Truncate(const std::string& fname, size_t size) {
+  return winenv_io_.Truncate(fname, size);
+}
+
 Status WinEnv::GetCurrentTime(int64_t* unix_time) {
   return winenv_io_.GetCurrentTime(unix_time);
 }
@@ -1169,8 +1301,13 @@ Status WinEnv::ReopenWritableFile(const std::string& fname,
 }
 
 Status WinEnv::NewRandomRWFile(const std::string & fname,
-  unique_ptr<RandomRWFile>* result, const EnvOptions & options) {
+  std::unique_ptr<RandomRWFile>* result, const EnvOptions & options) {
   return winenv_io_.NewRandomRWFile(fname, result, options);
+}
+
+Status WinEnv::NewMemoryMappedFileBuffer(const std::string& fname,
+  std::unique_ptr<MemoryMappedFileBuffer>* result) {
+  return winenv_io_.NewMemoryMappedFileBuffer(fname, result);
 }
 
 Status WinEnv::NewDirectory(const std::string& name,
@@ -1217,6 +1354,10 @@ Status WinEnv::RenameFile(const std::string& src,
 Status WinEnv::LinkFile(const std::string& src,
   const std::string& target) {
   return winenv_io_.LinkFile(src, target);
+}
+
+Status WinEnv::NumFileLinks(const std::string& fname, uint64_t* count) {
+  return winenv_io_.NumFileLinks(fname, count);
 }
 
 Status WinEnv::AreFilesSame(const std::string& first,
@@ -1304,6 +1445,11 @@ int WinEnv::GetBackgroundThreads(Env::Priority pri) {
 
 void  WinEnv::IncBackgroundThreadsIfNeeded(int num, Env::Priority pri) {
   return winenv_threads_.IncBackgroundThreadsIfNeeded(num, pri);
+}
+
+EnvOptions WinEnv::OptimizeForManifestRead(
+  const EnvOptions& env_options) const {
+  return winenv_io_.OptimizeForManifestRead(env_options);
 }
 
 EnvOptions WinEnv::OptimizeForLogWrite(const EnvOptions& env_options,

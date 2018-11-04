@@ -63,7 +63,7 @@ DBTestBase::DBTestBase(const std::string path)
       option_config_(kDefault) {
   env_->SetBackgroundThreads(1, Env::LOW);
   env_->SetBackgroundThreads(1, Env::HIGH);
-  dbname_ = test::TmpDir(env_) + path;
+  dbname_ = test::PerThreadDBPath(env_, path);
   alternative_wal_dir_ = dbname_ + "/wal";
   alternative_db_log_dir_ = dbname_ + "/db_log_dir";
   auto options = CurrentOptions();
@@ -118,7 +118,8 @@ bool DBTestBase::ShouldSkipOptions(int option_config, int skip_mask) {
 
     if ((skip_mask & kSkipUniversalCompaction) &&
         (option_config == kUniversalCompaction ||
-         option_config == kUniversalCompactionMultiLevel)) {
+         option_config == kUniversalCompactionMultiLevel ||
+         option_config == kUniversalSubcompactions)) {
       return true;
     }
     if ((skip_mask & kSkipMergePut) && option_config == kMergePut) {
@@ -258,6 +259,47 @@ bool DBTestBase::ChangeFilterOptions() {
   return true;
 }
 
+// Switch between different DB options for file ingestion tests.
+bool DBTestBase::ChangeOptionsForFileIngestionTest() {
+  if (option_config_ == kDefault) {
+    option_config_ = kUniversalCompaction;
+    Destroy(last_options_);
+    auto options = CurrentOptions();
+    options.create_if_missing = true;
+    TryReopen(options);
+    return true;
+  } else if (option_config_ == kUniversalCompaction) {
+    option_config_ = kUniversalCompactionMultiLevel;
+    Destroy(last_options_);
+    auto options = CurrentOptions();
+    options.create_if_missing = true;
+    TryReopen(options);
+    return true;
+  } else if (option_config_ == kUniversalCompactionMultiLevel) {
+    option_config_ = kLevelSubcompactions;
+    Destroy(last_options_);
+    auto options = CurrentOptions();
+    assert(options.max_subcompactions > 1);
+    TryReopen(options);
+    return true;
+  } else if (option_config_ == kLevelSubcompactions) {
+    option_config_ = kUniversalSubcompactions;
+    Destroy(last_options_);
+    auto options = CurrentOptions();
+    assert(options.max_subcompactions > 1);
+    TryReopen(options);
+    return true;
+  } else if (option_config_ == kUniversalSubcompactions) {
+    option_config_ = kDirectIO;
+    Destroy(last_options_);
+    auto options = CurrentOptions();
+    TryReopen(options);
+    return true;
+  } else {
+    return false;
+  }
+}
+
 // Return the current option configuration.
 Options DBTestBase::CurrentOptions(
     const anon::OptionsOverride& options_override) const {
@@ -346,6 +388,26 @@ Options DBTestBase::GetOptions(
           NewHashCuckooRepFactory(options.write_buffer_size));
       options.allow_concurrent_memtable_write = false;
       break;
+      case kDirectIO: {
+        options.use_direct_reads = true;
+        options.use_direct_io_for_flush_and_compaction = true;
+        options.compaction_readahead_size = 2 * 1024 * 1024;
+  #if !defined(OS_MACOSX) && !defined(OS_WIN) && !defined(OS_SOLARIS) && \
+      !defined(OS_AIX) && !defined(OS_OPENBSD)
+        rocksdb::SyncPoint::GetInstance()->SetCallBack(
+            "NewWritableFile:O_DIRECT", [&](void* arg) {
+              int* val = static_cast<int*>(arg);
+              *val &= ~O_DIRECT;
+            });
+        rocksdb::SyncPoint::GetInstance()->SetCallBack(
+            "NewRandomAccessFile:O_DIRECT", [&](void* arg) {
+              int* val = static_cast<int*>(arg);
+              *val &= ~O_DIRECT;
+            });
+        rocksdb::SyncPoint::GetInstance()->EnableProcessing();
+  #endif
+        break;
+      }
 #endif  // ROCKSDB_LITE
     case kMergePut:
       options.merge_operator = MergeOperators::CreatePutOperator();
@@ -409,6 +471,10 @@ Options DBTestBase::GetOptions(
       table_options.checksum = kxxHash;
       break;
     }
+    case kxxHash64Checksum: {
+      table_options.checksum = kxxHash64;
+      break;
+    }
     case kFIFOCompaction: {
       options.compaction_style = kCompactionStyleFIFO;
       break;
@@ -426,6 +492,18 @@ Options DBTestBase::GetOptions(
     case kBlockBasedTableWithPartitionedIndex: {
       table_options.index_type = BlockBasedTableOptions::kTwoLevelIndexSearch;
       options.prefix_extractor.reset(NewNoopTransform());
+      break;
+    }
+    case kBlockBasedTableWithPartitionedIndexFormat4: {
+      table_options.format_version = 4;
+      // Format 4 changes the binary index format. Since partitioned index is a
+      // super-set of simple indexes, we are also using kTwoLevelIndexSearch to
+      // test this format.
+      table_options.index_type = BlockBasedTableOptions::kTwoLevelIndexSearch;
+      // The top-level index in partition filters are also affected by format 4.
+      table_options.filter_policy.reset(NewBloomFilterPolicy(10, false));
+      table_options.partition_filters = true;
+      table_options.index_block_restart_interval = 8;
       break;
     }
     case kBlockBasedTableWithIndexRestartInterval: {
@@ -458,26 +536,6 @@ Options DBTestBase::GetOptions(
     case kConcurrentSkipList: {
       options.allow_concurrent_memtable_write = true;
       options.enable_write_thread_adaptive_yield = true;
-      break;
-    }
-    case kDirectIO: {
-      options.use_direct_reads = true;
-      options.use_direct_io_for_flush_and_compaction = true;
-      options.compaction_readahead_size = 2 * 1024 * 1024;
-#if !defined(OS_MACOSX) && !defined(OS_WIN) && !defined(OS_SOLARIS) && \
-    !defined(OS_AIX) && !defined(OS_OPENBSD)
-      rocksdb::SyncPoint::GetInstance()->SetCallBack(
-          "NewWritableFile:O_DIRECT", [&](void* arg) {
-            int* val = static_cast<int*>(arg);
-            *val &= ~O_DIRECT;
-          });
-      rocksdb::SyncPoint::GetInstance()->SetCallBack(
-          "NewRandomAccessFile:O_DIRECT", [&](void* arg) {
-            int* val = static_cast<int*>(arg);
-            *val &= ~O_DIRECT;
-          });
-      rocksdb::SyncPoint::GetInstance()->EnableProcessing();
-#endif
       break;
     }
     case kPipelinedWrite: {
@@ -575,9 +633,17 @@ void DBTestBase::DestroyAndReopen(const Options& options) {
   ASSERT_OK(TryReopen(options));
 }
 
-void DBTestBase::Destroy(const Options& options) {
+void DBTestBase::Destroy(const Options& options, bool delete_cf_paths) {
+  std::vector<ColumnFamilyDescriptor> column_families;
+  if (delete_cf_paths) {
+    for (size_t i = 0; i < handles_.size(); ++i) {
+      ColumnFamilyDescriptor cfdescriptor;
+      handles_[i]->GetDescriptor(&cfdescriptor);
+      column_families.push_back(cfdescriptor);
+    }
+  }
   Close();
-  ASSERT_OK(DestroyDB(dbname_, options));
+  ASSERT_OK(DestroyDB(dbname_, options, column_families));
 }
 
 Status DBTestBase::ReadOnlyReopen(const Options& options) {
@@ -623,6 +689,13 @@ Status DBTestBase::Flush(int cf) {
   } else {
     return db_->Flush(FlushOptions(), handles_[cf]);
   }
+}
+
+Status DBTestBase::Flush(const std::vector<int>& cf_ids) {
+  std::vector<ColumnFamilyHandle*> cfhs;
+  std::for_each(cf_ids.begin(), cf_ids.end(),
+                [&cfhs, this](int id) { cfhs.emplace_back(handles_[id]); });
+  return db_->Flush(FlushOptions(), cfhs);
 }
 
 Status DBTestBase::Put(const Slice& k, const Slice& v, WriteOptions wo) {
@@ -1017,9 +1090,9 @@ std::string DBTestBase::DumpSSTableList() {
   return property;
 }
 
-void DBTestBase::GetSstFiles(std::string path,
+void DBTestBase::GetSstFiles(Env* env, std::string path,
                              std::vector<std::string>* files) {
-  env_->GetChildren(path, files);
+  env->GetChildren(path, files);
 
   files->erase(
       std::remove_if(files->begin(), files->end(), [](std::string name) {
@@ -1031,7 +1104,7 @@ void DBTestBase::GetSstFiles(std::string path,
 
 int DBTestBase::GetSstFileCount(std::string path) {
   std::vector<std::string> files;
-  GetSstFiles(path, &files);
+  DBTestBase::GetSstFiles(env_, path, &files);
   return static_cast<int>(files.size());
 }
 

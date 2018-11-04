@@ -14,8 +14,7 @@
 // All Env implementations are safe for concurrent access from
 // multiple threads without any external synchronization.
 
-#ifndef STORAGE_ROCKSDB_INCLUDE_ENV_H_
-#define STORAGE_ROCKSDB_INCLUDE_ENV_H_
+#pragma once
 
 #include <stdint.h>
 #include <cstdarg>
@@ -42,6 +41,7 @@ class SequentialFile;
 class Slice;
 class WritableFile;
 class RandomRWFile;
+class MemoryMappedFileBuffer;
 class Directory;
 struct DBOptions;
 struct ImmutableDBOptions;
@@ -204,6 +204,16 @@ class Env {
     return Status::NotSupported("RandomRWFile is not implemented in this Env");
   }
 
+  // Opens `fname` as a memory-mapped file for read and write (in-place updates
+  // only, i.e., no appends). On success, stores a raw buffer covering the whole
+  // file in `*result`. The file must exist prior to this call.
+  virtual Status NewMemoryMappedFileBuffer(
+      const std::string& /*fname*/,
+      unique_ptr<MemoryMappedFileBuffer>* /*result*/) {
+    return Status::NotSupported(
+        "MemoryMappedFileBuffer is not implemented in this Env");
+  }
+
   // Create an object that represents a directory. Will fail if directory
   // doesn't exist. If the directory exists, it will open the directory
   // and create a new Directory object.
@@ -247,6 +257,11 @@ class Env {
   // Delete the named file.
   virtual Status DeleteFile(const std::string& fname) = 0;
 
+  // Truncate the named file to the specified size.
+  virtual Status Truncate(const std::string& /*fname*/, size_t /*size*/) {
+    return Status::NotSupported("Truncate is not supported for this Env");
+  }
+
   // Create the specified directory. Returns error if directory exists.
   virtual Status CreateDir(const std::string& dirname) = 0;
 
@@ -271,6 +286,12 @@ class Env {
   virtual Status LinkFile(const std::string& /*src*/,
                           const std::string& /*target*/) {
     return Status::NotSupported("LinkFile is not supported for this Env");
+  }
+
+  virtual Status NumFileLinks(const std::string& /*fname*/,
+                              uint64_t* /*count*/) {
+    return Status::NotSupported(
+        "Getting number of file links is not supported for this Env");
   }
 
   virtual Status AreFilesSame(const std::string& /*first*/,
@@ -301,6 +322,8 @@ class Env {
 
   // Priority for scheduling job in thread pool
   enum Priority { BOTTOM, LOW, HIGH, TOTAL };
+
+  static std::string PriorityToString(Priority priority);
 
   // Priority for requesting bytes in rate limiter scheduler
   enum IOPriority {
@@ -383,6 +406,10 @@ class Env {
   virtual void SetBackgroundThreads(int number, Priority pri = LOW) = 0;
   virtual int GetBackgroundThreads(Priority pri = LOW) = 0;
 
+  virtual Status SetAllowNonOwnerAccess(bool /*allow_non_owner_access*/) {
+    return Status::NotSupported("Not supported.");
+  }
+
   // Enlarge number of background worker threads of a specific thread pool
   // for this environment if it is smaller than specified. 'LOW' is the default
   // pool.
@@ -390,6 +417,9 @@ class Env {
 
   // Lower IO priority for threads from the specified pool.
   virtual void LowerThreadPoolIOPriority(Priority /*pool*/ = LOW) {}
+
+  // Lower CPU priority for threads from the specified pool.
+  virtual void LowerThreadPoolCPUPriority(Priority /*pool*/ = LOW) {}
 
   // Converts seconds-since-Jan-01-1970 to a printable string
   virtual std::string TimeToString(uint64_t time) = 0;
@@ -446,6 +476,15 @@ class Env {
 
   // Returns the ID of the current thread.
   virtual uint64_t GetThreadID() const;
+
+// This seems to clash with a macro on Windows, so #undef it here
+#undef GetFreeSpace
+
+  // Get the amount of free disk space
+  virtual Status GetFreeSpace(const std::string& /*path*/,
+                              uint64_t* /*diskfree*/) {
+    return Status::NotSupported();
+  }
 
  protected:
   // The pointer to an internal structure that will update the
@@ -795,6 +834,28 @@ class RandomRWFile {
   RandomRWFile& operator=(const RandomRWFile&) = delete;
 };
 
+// MemoryMappedFileBuffer object represents a memory-mapped file's raw buffer.
+// Subclasses should release the mapping upon destruction.
+class MemoryMappedFileBuffer {
+public:
+  MemoryMappedFileBuffer(void* _base, size_t _length)
+      : base_(_base), length_(_length) {}
+
+  virtual ~MemoryMappedFileBuffer() = 0;
+
+  // We do not want to unmap this twice. We can make this class
+  // movable if desired, however, since
+  MemoryMappedFileBuffer(const MemoryMappedFileBuffer&) = delete;
+  MemoryMappedFileBuffer& operator=(const MemoryMappedFileBuffer&) = delete;
+
+  void*       GetBase() const { return base_;   }
+  size_t      GetLen() const  { return length_; }
+
+protected:
+  void*        base_;
+  const size_t length_;
+};
+
 // Directory object represents collection of files and implements
 // filesystem operations that can be executed on directories.
 class Directory {
@@ -803,7 +864,7 @@ class Directory {
   // Fsync directory. Can be called concurrently from multiple threads.
   virtual Status Fsync() = 0;
 
-  virtual size_t GetUniqueId(char* id, size_t max_size) const {
+  virtual size_t GetUniqueId(char* /*id*/, size_t /*max_size*/) const {
     return 0;
   }
 };
@@ -1017,6 +1078,10 @@ class EnvWrapper : public Env {
     return target_->LinkFile(s, t);
   }
 
+  Status NumFileLinks(const std::string& fname, uint64_t* count) override {
+    return target_->NumFileLinks(fname, count);
+  }
+
   Status AreFilesSame(const std::string& first, const std::string& second,
                       bool* res) override {
     return target_->AreFilesSame(first, second, res);
@@ -1074,12 +1139,20 @@ class EnvWrapper : public Env {
     return target_->GetBackgroundThreads(pri);
   }
 
+  Status SetAllowNonOwnerAccess(bool allow_non_owner_access) override {
+    return target_->SetAllowNonOwnerAccess(allow_non_owner_access);
+  }
+
   void IncBackgroundThreadsIfNeeded(int num, Priority pri) override {
     return target_->IncBackgroundThreadsIfNeeded(num, pri);
   }
 
   void LowerThreadPoolIOPriority(Priority pool = LOW) override {
     target_->LowerThreadPoolIOPriority(pool);
+  }
+
+  void LowerThreadPoolCPUPriority(Priority pool = LOW) override {
+    target_->LowerThreadPoolCPUPriority(pool);
   }
 
   std::string TimeToString(uint64_t time) override {
@@ -1151,35 +1224,56 @@ class WritableFileWrapper : public WritableFile {
   Status Sync() override { return target_->Sync(); }
   Status Fsync() override { return target_->Fsync(); }
   bool IsSyncThreadSafe() const override { return target_->IsSyncThreadSafe(); }
+
+  bool use_direct_io() const override { return target_->use_direct_io(); }
+
+  size_t GetRequiredBufferAlignment() const override {
+    return target_->GetRequiredBufferAlignment();
+  }
+
   void SetIOPriority(Env::IOPriority pri) override {
     target_->SetIOPriority(pri);
   }
+
   Env::IOPriority GetIOPriority() override { return target_->GetIOPriority(); }
+
+  void SetWriteLifeTimeHint(Env::WriteLifeTimeHint hint) override {
+    target_->SetWriteLifeTimeHint(hint);
+  }
+
+  Env::WriteLifeTimeHint GetWriteLifeTimeHint() override {
+    return target_->GetWriteLifeTimeHint();
+  }
+
   uint64_t GetFileSize() override { return target_->GetFileSize(); }
-  void GetPreallocationStatus(size_t* block_size,
-                              size_t* last_allocated_block) override {
-    target_->GetPreallocationStatus(block_size, last_allocated_block);
-  }
-  size_t GetUniqueId(char* id, size_t max_size) const override {
-    return target_->GetUniqueId(id, max_size);
-  }
-  Status InvalidateCache(size_t offset, size_t length) override {
-    return target_->InvalidateCache(offset, length);
-  }
 
   void SetPreallocationBlockSize(size_t size) override {
     target_->SetPreallocationBlockSize(size);
   }
+
+  void GetPreallocationStatus(size_t* block_size,
+                              size_t* last_allocated_block) override {
+    target_->GetPreallocationStatus(block_size, last_allocated_block);
+  }
+
+  size_t GetUniqueId(char* id, size_t max_size) const override {
+    return target_->GetUniqueId(id, max_size);
+  }
+
+  Status InvalidateCache(size_t offset, size_t length) override {
+    return target_->InvalidateCache(offset, length);
+  }
+
+  Status RangeSync(uint64_t offset, uint64_t nbytes) override {
+    return target_->RangeSync(offset, nbytes);
+  }
+
   void PrepareWrite(size_t offset, size_t len) override {
     target_->PrepareWrite(offset, len);
   }
 
- protected:
   Status Allocate(uint64_t offset, uint64_t len) override {
     return target_->Allocate(offset, len);
-  }
-  Status RangeSync(uint64_t offset, uint64_t nbytes) override {
-    return target_->RangeSync(offset, nbytes);
   }
 
  private:
@@ -1202,5 +1296,3 @@ Status NewHdfsEnv(Env** hdfs_env, const std::string& fsname);
 Env* NewTimedEnv(Env* base_env);
 
 }  // namespace rocksdb
-
-#endif  // STORAGE_ROCKSDB_INCLUDE_ENV_H_

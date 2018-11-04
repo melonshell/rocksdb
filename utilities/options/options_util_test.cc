@@ -34,7 +34,7 @@ class OptionsUtilTest : public testing::Test {
  public:
   OptionsUtilTest() : rnd_(0xFB) {
     env_.reset(new test::StringEnv(Env::Default()));
-    dbname_ = test::TmpDir() + "/options_util_test";
+    dbname_ = test::PerThreadDBPath("options_util_test");
   }
 
  protected:
@@ -311,7 +311,7 @@ int main(int argc, char** argv) {
 #else
 #include <cstdio>
 
-int main(int argc, char** argv) {
+int main(int /*argc*/, char** /*argv*/) {
   printf("Skipped in RocksDBLite as utilities are not supported.\n");
   return 0;
 }

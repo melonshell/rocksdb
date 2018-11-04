@@ -101,10 +101,12 @@ class Repairer {
         db_options_(SanitizeOptions(dbname_, db_options)),
         immutable_db_options_(ImmutableDBOptions(db_options_)),
         icmp_(default_cf_opts.comparator),
-        default_cf_opts_(default_cf_opts),
+        default_cf_opts_(
+            SanitizeOptions(immutable_db_options_, default_cf_opts)),
         default_cf_iopts_(
-            ImmutableCFOptions(immutable_db_options_, default_cf_opts)),
-        unknown_cf_opts_(unknown_cf_opts),
+            ImmutableCFOptions(immutable_db_options_, default_cf_opts_)),
+        unknown_cf_opts_(
+            SanitizeOptions(immutable_db_options_, unknown_cf_opts)),
         create_unknown_cfs_(create_unknown_cfs),
         raw_table_cache_(
             // TableCache can be small since we expect each table to be opened
@@ -161,11 +163,18 @@ class Repairer {
   }
 
   ~Repairer() {
+    if (db_lock_ != nullptr) {
+      env_->UnlockFile(db_lock_);
+    }
     delete table_cache_;
   }
 
   Status Run() {
-    Status status = FindFiles();
+    Status status = env_->LockFile(LockFileName(dbname_), &db_lock_);
+    if (!status.ok()) {
+      return status;
+    }
+    status = FindFiles();
     if (status.ok()) {
       // Discard older manifests and start a fresh one
       for (size_t i = 0; i < manifests_.size(); i++) {
@@ -203,7 +212,7 @@ class Repairer {
       ROCKS_LOG_WARN(db_options_.info_log,
                      "**** Repaired rocksdb %s; "
                      "recovered %" ROCKSDB_PRIszt " files; %" PRIu64
-                     "bytes. "
+                     " bytes. "
                      "Some data may have been lost. "
                      "****",
                      dbname_.c_str(), tables_.size(), bytes);
@@ -243,6 +252,9 @@ class Repairer {
   std::vector<uint64_t> logs_;
   std::vector<TableInfo> tables_;
   uint64_t next_file_number_;
+  // Lock over the persistent DB state. Non-nullptr iff successfully
+  // acquired.
+  FileLock* db_lock_;
 
   Status FindFiles() {
     std::vector<std::string> filenames;
@@ -339,7 +351,7 @@ class Repairer {
       return status;
     }
     unique_ptr<SequentialFileReader> lfile_reader(
-        new SequentialFileReader(std::move(lfile)));
+        new SequentialFileReader(std::move(lfile), logname));
 
     // Create the log reader.
     LogReporter reporter;
@@ -351,7 +363,8 @@ class Repairer {
     // propagating bad information (like overly large sequence
     // numbers).
     log::Reader reader(db_options_.info_log, std::move(lfile_reader), &reporter,
-                       true /*enable checksum*/, 0 /*initial_offset*/, log);
+                       true /*enable checksum*/, log,
+                       false /* retry_after_eof */);
 
     // Initialize per-column family memtables
     for (auto* cfd : *vset_.GetColumnFamilySet()) {
@@ -498,8 +511,9 @@ class Repairer {
     }
     if (status.ok()) {
       InternalIterator* iter = table_cache_->NewIterator(
-          ReadOptions(), env_options_, cfd->internal_comparator(), t->meta.fd,
-          nullptr /* range_del_agg */);
+          ReadOptions(), env_options_, cfd->internal_comparator(), t->meta,
+          nullptr /* range_del_agg */,
+          cfd->GetLatestMutableCFOptions()->prefix_extractor.get());
       bool empty = true;
       ParsedInternalKey parsed;
       t->min_sequence = 0;

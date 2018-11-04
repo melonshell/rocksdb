@@ -67,7 +67,8 @@ BlockBasedFilterBlockBuilder::BlockBasedFilterBlockBuilder(
       prefix_extractor_(prefix_extractor),
       whole_key_filtering_(table_opt.whole_key_filtering),
       prev_prefix_start_(0),
-      prev_prefix_size_(0) {
+      prev_prefix_size_(0),
+      num_added_(0) {
   assert(policy_);
 }
 
@@ -91,6 +92,7 @@ void BlockBasedFilterBlockBuilder::Add(const Slice& key) {
 
 // Add key to filter if needed
 inline void BlockBasedFilterBlockBuilder::AddKey(const Slice& key) {
+  num_added_++;
   start_.push_back(entries_.size());
   entries_.append(key.data(), key.size());
 }
@@ -106,10 +108,9 @@ inline void BlockBasedFilterBlockBuilder::AddPrefix(const Slice& key) {
   Slice prefix = prefix_extractor_->Transform(key);
   // insert prefix only when it's different from the previous prefix.
   if (prev.size() == 0 || prefix != prev) {
-    start_.push_back(entries_.size());
     prev_prefix_start_ = entries_.size();
     prev_prefix_size_ = prefix.size();
-    entries_.append(prefix.data(), prefix.size());
+    AddKey(prefix);
   }
 }
 
@@ -185,7 +186,8 @@ BlockBasedFilterBlockReader::BlockBasedFilterBlockReader(
 }
 
 bool BlockBasedFilterBlockReader::KeyMayMatch(
-    const Slice& key, uint64_t block_offset, const bool /*no_io*/,
+    const Slice& key, const SliceTransform* /* prefix_extractor */,
+    uint64_t block_offset, const bool /*no_io*/,
     const Slice* const /*const_ikey_ptr*/) {
   assert(block_offset != kNotValid);
   if (!whole_key_filtering_) {
@@ -195,12 +197,10 @@ bool BlockBasedFilterBlockReader::KeyMayMatch(
 }
 
 bool BlockBasedFilterBlockReader::PrefixMayMatch(
-    const Slice& prefix, uint64_t block_offset, const bool /*no_io*/,
+    const Slice& prefix, const SliceTransform* /* prefix_extractor */,
+    uint64_t block_offset, const bool /*no_io*/,
     const Slice* const /*const_ikey_ptr*/) {
   assert(block_offset != kNotValid);
-  if (!prefix_extractor_) {
-    return true;
-  }
   return MayMatch(prefix, block_offset);
 }
 

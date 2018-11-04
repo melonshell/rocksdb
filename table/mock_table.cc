@@ -26,14 +26,16 @@ stl_wrappers::KVMap MakeMockFile(
   return stl_wrappers::KVMap(l, stl_wrappers::LessOfComparator(&icmp_));
 }
 
-InternalIterator* MockTableReader::NewIterator(const ReadOptions&,
-                                               Arena* /*arena*/,
-                                               bool /*skip_filters*/) {
+InternalIterator* MockTableReader::NewIterator(
+    const ReadOptions&, const SliceTransform* /* prefix_extractor */,
+    Arena* /*arena*/, bool /*skip_filters*/, bool /*for_compaction*/) {
   return new MockTableIterator(table_);
 }
 
 Status MockTableReader::Get(const ReadOptions&, const Slice& key,
-                            GetContext* get_context, bool /*skip_filters*/) {
+                            GetContext* get_context,
+                            const SliceTransform* /*prefix_extractor*/,
+                            bool /*skip_filters*/) {
   std::unique_ptr<MockTableIterator> iter(new MockTableIterator(table_));
   for (iter->Seek(key); iter->Valid(); iter->Next()) {
     ParsedInternalKey parsed_key;
@@ -41,7 +43,8 @@ Status MockTableReader::Get(const ReadOptions&, const Slice& key,
       return Status::Corruption(Slice());
     }
 
-    if (!get_context->SaveValue(parsed_key, iter->value())) {
+    bool dont_care __attribute__((__unused__));
+    if (!get_context->SaveValue(parsed_key, iter->value(), &dont_care)) {
       break;
     }
   }
@@ -90,7 +93,7 @@ Status MockTableFactory::CreateMockTable(Env* env, const std::string& fname,
     return s;
   }
 
-  WritableFileWriter file_writer(std::move(file), EnvOptions());
+  WritableFileWriter file_writer(std::move(file), fname, EnvOptions());
 
   uint32_t id = GetAndWriteNextID(&file_writer);
   file_system_.files.insert({id, std::move(file_contents)});
